@@ -10,7 +10,7 @@ environment:
   sdk: ^3.10.0
 
 
-dependencies:
+dependencies: 
   flutter:
     sdk: flutter
 
@@ -29,7 +29,6 @@ dependencies:
 
   # Networking
   dio: ^5.4.0
-  http: ^1.2.0
   
   # Environment variables
   flutter_dotenv: ^5.1.0

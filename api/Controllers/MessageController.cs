@@ -6,7 +6,10 @@ using RealEstateHubAPI.DTOs;
 using RealEstateHubAPI.Hubs;
 using RealEstateHubAPI.Model;
 using RealEstateHubAPI.Models;
+using RealEstateHubAPI.Utils;
+using System;
 using System.Security.Claims;
+using Microsoft.AspNetCore.Hosting;
 
 namespace RealEstateHubAPI.Controllers
 {
@@ -17,23 +20,26 @@ namespace RealEstateHubAPI.Controllers
     [ApiController]
     [Route("api/messages")]
     [Authorize] // Yêu cầu authentication
-    public class MessageController : ControllerBase
+    public class MessageController : BaseController
     {
         private readonly ApplicationDbContext _context;
         private readonly IHubContext<MessageHub> _messageHub;
         private readonly IHubContext<NotificationHub> _notificationHub;
         private readonly ILogger<MessageController> _logger;
+        private readonly IWebHostEnvironment _env;
 
         public MessageController(
             ApplicationDbContext context,
             IHubContext<MessageHub> messageHub,
             IHubContext<NotificationHub> notificationHub,
-            ILogger<MessageController> logger)
+            ILogger<MessageController> logger,
+            IWebHostEnvironment env)
         {
             _context = context;
             _messageHub = messageHub;
             _notificationHub = notificationHub;
             _logger = logger;
+            _env = env;
         }
 
         /// <summary>
@@ -71,25 +77,25 @@ namespace RealEstateHubAPI.Controllers
                 var senderId = GetUserId();
                 if (!senderId.HasValue)
                 {
-                    return Unauthorized("User not authenticated");
+                    return UnauthorizedResponse("User not authenticated");
                 }
 
                 if (!ModelState.IsValid)
                 {
-                    return BadRequest(ModelState);
+                    return BadRequestResponse("Dữ liệu không hợp lệ");
                 }
 
                 // Validate: không được gửi tin nhắn cho chính mình
                 if (dto.ReceiverId == senderId.Value)
                 {
-                    return BadRequest("Cannot send message to yourself");
+                    return BadRequestResponse("Cannot send message to yourself");
                 }
 
                 // Kiểm tra receiver tồn tại
                 var receiver = await _context.Users.FindAsync(dto.ReceiverId);
                 if (receiver == null)
                 {
-                    return BadRequest($"Receiver with ID {dto.ReceiverId} not found");
+                    return BadRequestResponse($"Receiver with ID {dto.ReceiverId} not found");
                 }
 
                 // Kiểm tra post tồn tại (nếu có)
@@ -101,27 +107,32 @@ namespace RealEstateHubAPI.Controllers
                         .FirstOrDefaultAsync(p => p.Id == dto.PostId.Value);
                     if (post == null)
                     {
-                        return BadRequest($"Post with ID {dto.PostId} not found");
+                        return BadRequestResponse($"Post with ID {dto.PostId} not found");
                     }
                 }
 
-                if (string.IsNullOrWhiteSpace(dto.Content))
+                // Validate: Phải có Content hoặc ImageUrl (ít nhất một trong hai)
+                if (string.IsNullOrWhiteSpace(dto.Content) && string.IsNullOrWhiteSpace(dto.ImageUrl))
                 {
-                    return BadRequest("Message content cannot be empty");
+                    return BadRequestResponse("Message content or image is required");
                 }
 
                 // Tạo ConversationId để định danh cho đoạn chat (chỉ dùng SenderId và ReceiverId)
                 var conversationId = GenerateConversationId(senderId.Value, dto.ReceiverId);
 
                 // Lưu tin nhắn vào database
+                // Sử dụng DateTimeHelper để đảm bảo timezone đúng (Vietnam GMT+7)
                 var message = new Message
                 {
                     SenderId = senderId.Value,
                     ReceiverId = dto.ReceiverId,
                     PostId = dto.PostId ?? 0, // Nếu không có PostId, dùng 0
                     ConversationId = conversationId,
-                    Content = dto.Content,
-                    SentTime = DateTime.UtcNow
+                    Content = !string.IsNullOrWhiteSpace(dto.Content) 
+                        ? dto.Content 
+                        : (dto.ImageUrl != null ? "[Hình ảnh]" : ""),
+                    ImageUrl = string.IsNullOrWhiteSpace(dto.ImageUrl) ? null : dto.ImageUrl,
+                    SentTime = DateTimeHelper.GetVietnamNow()
                 };
 
                 _context.Messages.Add(message);
@@ -145,6 +156,7 @@ namespace RealEstateHubAPI.Controllers
                     PostUserName = post?.User?.Name,
                     ConversationId = conversationId,
                     Content = message.Content,
+                    ImageUrl = message.ImageUrl,
                     SentTime = message.SentTime
                 };
 
@@ -165,7 +177,7 @@ namespace RealEstateHubAPI.Controllers
                         : $"{sender.Name} đã gửi tin nhắn cho bạn",
                     Type = "Message",
                     IsRead = false,
-                    CreatedAt = DateTime.UtcNow
+                    CreatedAt = DateTimeHelper.GetVietnamNow() // Sử dụng DateTimeHelper để đảm bảo timezone đúng
                 };
 
                 _context.Notifications.Add(notification);
@@ -189,12 +201,12 @@ namespace RealEstateHubAPI.Controllers
 
                 _logger.LogInformation($"Message {message.Id} sent from {senderId.Value} to {dto.ReceiverId}");
 
-                return Ok(messageDto);
+                return Success(messageDto, "Gửi tin nhắn thành công");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error sending message");
-                return StatusCode(500, new { error = "Internal server error", message = ex.Message });
+                return InternalServerError($"Lỗi máy chủ nội bộ: {ex.Message}");
             }
         }
 
@@ -211,7 +223,7 @@ namespace RealEstateHubAPI.Controllers
                 var userId = GetUserId();
                 if (!userId.HasValue)
                 {
-                    return Unauthorized("User not authenticated");
+                    return UnauthorizedResponse("User not authenticated");
                 }
 
                 var conversations = await _context.Messages
@@ -248,6 +260,7 @@ namespace RealEstateHubAPI.Controllers
                                 : null,
                             ConversationId = g.Key,
                             Content = g.OrderByDescending(m => m.SentTime).First().Content,
+                            ImageUrl = g.OrderByDescending(m => m.SentTime).First().ImageUrl,
                             SentTime = g.OrderByDescending(m => m.SentTime).First().SentTime
                         },
                         MessageCount = g.Count()
@@ -255,12 +268,12 @@ namespace RealEstateHubAPI.Controllers
                     .OrderByDescending(c => c.LastMessage.SentTime)
                     .ToListAsync();
 
-                return Ok(conversations);
+                return Success(conversations, "Lấy danh sách cuộc hội thoại thành công");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error getting conversations");
-                return StatusCode(500, new { error = "Internal server error", message = ex.Message });
+                return InternalServerError($"Lỗi máy chủ nội bộ: {ex.Message}");
             }
         }
 
@@ -277,7 +290,7 @@ namespace RealEstateHubAPI.Controllers
                 var userId = GetUserId();
                 if (!userId.HasValue)
                 {
-                    return Unauthorized("User not authenticated");
+                    return UnauthorizedResponse("User not authenticated");
                 }
 
                 // Tạo ConversationId từ 2 userId
@@ -302,18 +315,84 @@ namespace RealEstateHubAPI.Controllers
                         PostId = m.PostId,
                         PostTitle = m.Post != null ? m.Post.Title : null,
                         PostUserName = m.Post != null && m.Post.User != null ? m.Post.User.Name : null,
-                        ConversationId = m.ConversationId,
-                        Content = m.Content,
-                        SentTime = m.SentTime
-                    })
-                    .ToListAsync();
+                    ConversationId = m.ConversationId,
+                    Content = m.Content,
+                    ImageUrl = m.ImageUrl,
+                    SentTime = m.SentTime
+                })
+                .ToListAsync();
 
-                return Ok(messages);
+                return Success(messages, "Lấy lịch sử chat thành công");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error getting conversation");
-                return StatusCode(500, new { error = "Internal server error", message = ex.Message });
+                return InternalServerError($"Lỗi máy chủ nội bộ: {ex.Message}");
+            }
+        }
+
+        [HttpPost("upload-image")]
+        [ProducesResponseType(typeof(string), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        public async Task<IActionResult> UploadMessageImage([FromForm] IFormFile image)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (!userId.HasValue)
+                {
+                    return UnauthorizedResponse("User not authenticated");
+                }
+
+                // Validate file
+                if (image == null || image.Length == 0)
+                {
+                    return BadRequestResponse("Không có file được tải lên");
+                }
+
+                // Validate file type (chỉ cho phép image)
+                var allowedExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp" };
+                var fileExtension = Path.GetExtension(image.FileName).ToLowerInvariant();
+                if (!allowedExtensions.Contains(fileExtension))
+                {
+                    return BadRequestResponse("Chỉ cho phép file hình ảnh (jpg, jpeg, png, gif, webp)");
+                }
+
+                // Validate file size (max 5MB)
+                const long maxFileSize = 5 * 1024 * 1024; // 5MB
+                if (image.Length > maxFileSize)
+                {
+                    return BadRequestResponse("Kích thước file không được vượt quá 5MB");
+                }
+
+                // Tạo thư mục lưu ảnh message nếu chưa có
+                var uploadsFolder = Path.Combine(_env.WebRootPath, "uploads", "messages");
+                if (!Directory.Exists(uploadsFolder))
+                {
+                    Directory.CreateDirectory(uploadsFolder);
+                }
+
+                // Tạo tên file mới tránh trùng
+                var fileName = $"{Guid.NewGuid()}{fileExtension}";
+                var filePath = Path.Combine(uploadsFolder, fileName);
+
+                // Lưu file lên server
+                using (var stream = new FileStream(filePath, FileMode.Create))
+                {
+                    await image.CopyToAsync(stream);
+                }
+
+                // Trả về URL của ảnh
+                var imageUrl = $"/uploads/messages/{fileName}";
+                _logger.LogInformation($"Message image uploaded: {imageUrl} by user {userId.Value}");
+
+                return Success(imageUrl, "Upload hình ảnh thành công");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error uploading message image");
+                return InternalServerError($"Lỗi máy chủ nội bộ: {ex.Message}");
             }
         }
     }
